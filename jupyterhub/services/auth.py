@@ -9,11 +9,17 @@ model describing the authenticated user.
 authenticate with the Hub.
 
 """
+
+import base64
+import json
 import os
+import random
 import re
 import socket
+import string
 import time
 from urllib.parse import quote, urlencode
+import uuid
 import warnings
 
 import requests
@@ -239,7 +245,8 @@ class HubAuth(Configurable):
         headers.setdefault('Authorization', 'token %s' % self.api_token)
         try:
             r = requests.request(method, url, **kwargs)
-        except requests.ConnectionError:
+        except requests.ConnectionError as e:
+            app_log.error("Error connecting to %s: %s", self.api_url, e)
             msg = "Failed to connect to Hub API at %r." % self.api_url
             msg += "  Is the Hub accessible at this URL (from host: %s)?" % socket.gethostname()
             if '127.0.0.1' in self.api_url:
@@ -397,6 +404,14 @@ class HubOAuth(HubAuth):
         """
         return self.oauth_client_id
 
+    @property
+    def state_cookie_name(self):
+        """The cookie name for storing OAuth state
+
+        This cookie is only live for the duration of the OAuth handshake.
+        """
+        return self.cookie_name + '-oauth-state'
+
     def _get_user_cookie(self, handler):
         token = handler.get_secure_cookie(self.cookie_name)
         if token:
@@ -475,6 +490,110 @@ class HubOAuth(HubAuth):
             })
 
         return token_reply['access_token']
+
+    def _encode_state(self, state):
+        """Encode a state dict as url-safe base64"""
+        # trim trailing `=` because 
+        json_state = json.dumps(state)
+        return base64.urlsafe_b64encode(
+            json_state.encode('utf8')
+        ).decode('ascii').rstrip('=')
+
+    def _decode_state(self, b64_state):
+        """Decode a base64 state
+
+        Always returns a dict.
+        The dict will be empty if the state is invalid.
+        """
+        if isinstance(b64_state, str):
+            b64_state = b64_state.encode('ascii')
+        if len(b64_state) != 4:
+            # restore padding
+            b64_state = b64_state + (b'=' * (4 - len(b64_state) % 4))
+        try:
+            json_state = base64.urlsafe_b64decode(b64_state).decode('utf8')
+        except ValueError:
+            app_log.error("Failed to b64-decode state: %r", b64_state)
+            return {}
+        try:
+            return json.loads(json_state)
+        except ValueError:
+            app_log.error("Failed to json-decode state: %r", json_state)
+            return {}
+
+    def set_state_cookie(self, handler, next_url=None):
+        """Generate an OAuth state and store it in a cookie
+
+        Parameters
+        ----------
+        handler (RequestHandler): A tornado RequestHandler
+        next_url (str): The page to redirect to on successful login
+
+        Returns
+        -------
+        state (str): The OAuth state that has been stored in the cookie (url safe, base64-encoded)
+        """
+        extra_state = {}
+        if handler.get_cookie(self.state_cookie_name):
+            # oauth state cookie is already set
+            # use a randomized cookie suffix to avoid collisions
+            # in case of concurrent logins
+            app_log.warning("Detected unused OAuth state cookies")
+            cookie_suffix = ''.join(random.choice(string.ascii_letters) for i in range(8))
+            cookie_name = '{}-{}'.format(self.state_cookie_name, cookie_suffix)
+            extra_state['cookie_name'] = cookie_name
+        else:
+            cookie_name = self.state_cookie_name
+        b64_state = self.generate_state(next_url, **extra_state)
+        kwargs = {
+            'path': self.base_url,
+            'httponly': True,
+            # Expire oauth state cookie in ten minutes.
+            # Usually this will be cleared by completed login
+            # in less than a few seconds.
+            # OAuth that doesn't complete shouldn't linger too long.
+            'max_age': 600,
+        }
+        if handler.request.protocol == 'https':
+            kwargs['secure'] = True
+        handler.set_secure_cookie(
+            cookie_name,
+            b64_state,
+            **kwargs
+        )
+        return b64_state
+
+    def generate_state(self, next_url=None, **extra_state):
+        """Generate a state string, given a next_url redirect target
+
+        Parameters
+        ----------
+        next_url (str): The URL of the page to redirect to on successful login.
+
+        Returns
+        -------
+        state (str): The base64-encoded state string.
+        """
+        state = {
+            'uuid': uuid.uuid4().hex,
+            'next_url': next_url,
+        }
+        state.update(extra_state)
+        return self._encode_state(state)
+
+    def get_next_url(self, b64_state=''):
+        """Get the next_url for redirection, given an encoded OAuth state"""
+        state = self._decode_state(b64_state)
+        return state.get('next_url') or self.base_url
+
+    def get_state_cookie_name(self, b64_state=''):
+        """Get the cookie name for oauth state, given an encoded OAuth state
+
+        Cookie name is stored in the state itself because the cookie name
+        is randomized to deal with races between concurrent oauth sequences.
+        """
+        state = self._decode_state(b64_state)
+        return state.get('cookie_name') or self.state_cookie_name
 
     def set_cookie(self, handler, access_token):
         """Set a cookie recording OAuth result"""
@@ -565,8 +684,13 @@ class HubAuthenticated(object):
 
     def get_login_url(self):
         """Return the Hub's login URL"""
-        app_log.debug("Redirecting to login url: %s" % self.hub_auth.login_url)
-        return self.hub_auth.login_url
+        login_url = self.hub_auth.login_url
+        if isinstance(self.hub_auth, HubOAuth):
+            # add state argument to OAuth url
+            state = self.hub_auth.set_state_cookie(self, next_url=self.request.uri)
+            login_url = url_concat(login_url, {'state': state})
+        app_log.debug("Redirecting to login url: %s", login_url)
+        return login_url
 
     def check_hub_user(self, model):
         """Check whether Hub-authenticated user or service should be allowed.
@@ -634,6 +758,19 @@ class HubAuthenticated(object):
         except Exception:
             self._hub_auth_user_cache = None
             raise
+
+        # store ?token=... tokens passed via url in a cookie for future requests
+        url_token = self.get_argument('token', '')
+        if (
+            user_model
+            and url_token
+            and getattr(self, '_token_authenticated', False)
+            and hasattr(self.hub_auth, 'set_cookie')
+        ):
+            # authenticated via `?token=`
+            # set a cookie for future requests
+            # hub_auth.set_cookie is only available on HubOAuth
+            self.hub_auth.set_cookie(self, url_token)
         return self._hub_auth_user_cache
 
 
@@ -657,6 +794,22 @@ class HubOAuthCallbackHandler(HubOAuthenticated, RequestHandler):
         code = self.get_argument("code", False)
         if not code:
             raise HTTPError(400, "oauth callback made without a token")
+
+        # validate OAuth state
+        arg_state = self.get_argument("state", None)
+        if arg_state is None:
+            raise HTTPError("oauth state is missing. Try logging in again.")
+        cookie_name = self.hub_auth.get_state_cookie_name(arg_state)
+        cookie_state = self.get_secure_cookie(cookie_name)
+        # clear cookie state now that we've consumed it
+        self.clear_cookie(cookie_name, path=self.hub_auth.base_url)
+        if isinstance(cookie_state, bytes):
+            cookie_state = cookie_state.decode('ascii', 'replace')
+        # check that state matches
+        if arg_state != cookie_state:
+            app_log.warning("oauth state %r != %r", arg_state, cookie_state)
+            raise HTTPError(403, "oauth state does not match. Try logging in again.")
+        next_url = self.hub_auth.get_next_url(cookie_state)
         # TODO: make async (in a Thread?)
         token = self.hub_auth.token_for_code(code)
         user_model = self.hub_auth.user_for_token(token)
@@ -664,7 +817,6 @@ class HubOAuthCallbackHandler(HubOAuthenticated, RequestHandler):
             raise HTTPError(500, "oauth callback failed to identify a user")
         app_log.info("Logged-in user %s", user_model)
         self.hub_auth.set_cookie(self, token)
-        next_url = self.get_argument('next', '') or self.hub_auth.base_url
-        self.redirect(next_url)
+        self.redirect(next_url or self.hub_auth.base_url)
 
 

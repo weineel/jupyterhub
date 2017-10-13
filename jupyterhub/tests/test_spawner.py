@@ -15,11 +15,13 @@ from unittest import mock
 import pytest
 from tornado import gen
 
-from ..user import User
 from ..objects import Hub, Server
+from .. import orm
 from .. import spawner as spawnermod
 from ..spawner import LocalProcessSpawner, Spawner
-from .. import orm
+from ..user import User
+from ..utils import new_token
+from .test_api import add_user
 from .utils import async_requests
 
 _echo_sleep = """
@@ -49,9 +51,9 @@ def new_spawner(db, **kwargs):
     kwargs.setdefault('notebook_dir', os.getcwd())
     kwargs.setdefault('default_url', '/user/{username}/lab')
     kwargs.setdefault('oauth_client_id', 'mock-client-id')
-    kwargs.setdefault('INTERRUPT_TIMEOUT', 1)
-    kwargs.setdefault('TERM_TIMEOUT', 1)
-    kwargs.setdefault('KILL_TIMEOUT', 1)
+    kwargs.setdefault('interrupt_timeout', 1)
+    kwargs.setdefault('term_timeout', 1)
+    kwargs.setdefault('kill_timeout', 1)
     kwargs.setdefault('poll_interval', 1)
     return user._new_spawner('', spawner_class=LocalProcessSpawner, **kwargs)
 
@@ -270,3 +272,111 @@ def test_inherit_ok():
 
         def poll():
             pass
+
+
+@pytest.mark.gen_test
+def test_spawner_reuse_api_token(db, app):
+    # setup: user with no tokens, whose spawner has set the .will_resume flag
+    user = add_user(app.db, app, name='snoopy')
+    spawner = user.spawner
+    assert user.api_tokens == []
+    # will_resume triggers reuse of tokens
+    spawner.will_resume = True
+    # first start: gets a new API token
+    yield user.spawn()
+    api_token = spawner.api_token
+    found = orm.APIToken.find(app.db, api_token)
+    assert found
+    assert found.user.name == user.name
+    assert user.api_tokens == [found]
+    yield user.stop()
+    # second start: should reuse the token
+    yield user.spawn()
+    # verify re-use of API token
+    assert spawner.api_token == api_token
+    # verify that a new token was not created
+    assert user.api_tokens == [found]
+
+
+@pytest.mark.gen_test
+def test_spawner_insert_api_token(app):
+    """Token provided by spawner is not in the db
+    
+    Insert token into db as a user-provided token.
+    """
+    # setup: new user, double check that they don't have any tokens registered
+    user = add_user(app.db, app, name='tonkee')
+    spawner = user.spawner
+    assert user.api_tokens == []
+
+    # setup: spawner's going to use a token that's not in the db
+    api_token = new_token()
+    assert not orm.APIToken.find(app.db, api_token)
+    user.spawner.use_this_api_token = api_token
+    # The spawner's provided API token would already be in the db
+    # unless there is a bug somewhere else (in the Spawner),
+    # but handle it anyway.
+    yield user.spawn()
+    assert spawner.api_token == api_token
+    found = orm.APIToken.find(app.db, api_token)
+    assert found
+    assert found.user.name == user.name
+    assert user.api_tokens == [found]
+    yield user.stop()
+
+
+@pytest.mark.gen_test
+def test_spawner_bad_api_token(app):
+    """Tokens are revoked when a Spawner gets another user's token"""
+    # we need two users for this one
+    user = add_user(app.db, app, name='antimone')
+    spawner = user.spawner
+    other_user = add_user(app.db, app, name='alabaster')
+    assert user.api_tokens == []
+    assert other_user.api_tokens == []
+
+    # create a token owned by alabaster that antimone's going to try to use
+    other_token = other_user.new_api_token()
+    spawner.use_this_api_token = other_token
+    assert len(other_user.api_tokens) == 1
+
+    # starting a user's server with another user's token
+    # should revoke it
+    with pytest.raises(ValueError):
+        yield user.spawn()
+    assert orm.APIToken.find(app.db, other_token) is None
+    assert other_user.api_tokens == []
+
+
+@pytest.mark.gen_test
+def test_spawner_delete_server(app):
+    """Test deleting spawner.server
+
+    This can occur during app startup if their server has been deleted.
+    """
+    db = app.db
+    user = add_user(app.db, app, name='gaston')
+    spawner = user.spawner
+    orm_server = orm.Server()
+    db.add(orm_server)
+    db.commit()
+    server_id = orm_server.id
+    spawner.server = Server.from_orm(orm_server)
+    db.commit()
+
+    assert spawner.server is not None
+    assert spawner.orm_spawner.server is not None
+
+    # trigger delete via db
+    db.delete(spawner.orm_spawner.server)
+    db.commit()
+    assert spawner.orm_spawner.server is None
+
+    # setting server = None also triggers delete
+    spawner.server = None
+    db.commit()
+    # verify that the server was actually deleted from the db
+    assert db.query(orm.Server).filter(orm.Server.id == server_id).first() is None
+    # verify that both ORM and top-level references are None
+    assert spawner.orm_spawner.server is None
+    assert spawner.server is None

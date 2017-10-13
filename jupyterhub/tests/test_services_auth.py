@@ -16,6 +16,7 @@ import requests_mock
 from tornado.ioloop import IOLoop
 from tornado.httpserver import HTTPServer
 from tornado.web import RequestHandler, Application, authenticated, HTTPError
+from tornado.httputil import url_concat
 
 from ..services.auth import _ExpiringDict, HubAuth, HubAuthenticated
 from ..utils import url_path_join
@@ -279,7 +280,7 @@ def test_hubauth_service_token(app, mockservice_url):
     name = 'test-api-service'
     app.service_tokens[token] = name
     yield app.init_api_tokens()
-    
+
     # token in Authorization header
     r = yield async_requests.get(public_url(app, mockservice_url) + '/whoami/',
         headers={
@@ -292,6 +293,7 @@ def test_hubauth_service_token(app, mockservice_url):
         'name': name,
         'admin': False,
     }
+    assert not r.cookies
 
     # token in ?token parameter
     r = yield async_requests.get(public_url(app, mockservice_url) + '/whoami/?token=%s' % token)
@@ -315,15 +317,25 @@ def test_hubauth_service_token(app, mockservice_url):
 
 @pytest.mark.gen_test
 def test_oauth_service(app, mockservice_url):
-    url = url_path_join(public_url(app, mockservice_url) + 'owhoami/')
+    service = mockservice_url
+    url = url_path_join(public_url(app, mockservice_url) + 'owhoami/?arg=x')
     # first request is only going to set login cookie
     # FIXME: redirect to originating URL (OAuth loses this info)
     s = requests.Session()
-    s.cookies = yield app.login_user('link')
+    name = 'link'
+    s.cookies = yield app.login_user(name)
     # run session.get in async_requests thread
     s_get = lambda *args, **kwargs: async_requests.executor.submit(s.get, *args, **kwargs)
     r = yield s_get(url)
     r.raise_for_status()
+    assert r.url == url
+    # verify oauth cookie is set
+    assert 'service-%s' % service.name in set(s.cookies.keys())
+    # verify oauth state cookie has been consumed
+    assert 'service-%s-oauth-state' % service.name not in set(s.cookies.keys())
+    # verify oauth state cookie was set at some point
+    assert set(r.history[0].cookies.keys()) == {'service-%s-oauth-state' % service.name}
+
     # second request should be authenticated
     r = yield s_get(url, allow_redirects=False)
     r.raise_for_status()
@@ -335,3 +347,82 @@ def test_oauth_service(app, mockservice_url):
         'kind': 'user',
     }
 
+    # token-authenticated request to HubOAuth
+    token = app.users[name].new_api_token()
+    # token in ?token parameter
+    r = yield async_requests.get(url_concat(url, {'token': token}))
+    r.raise_for_status()
+    reply = r.json()
+    assert reply['name'] == name
+
+    # verify that ?token= requests set a cookie
+    assert len(r.cookies) != 0
+    # ensure cookie works in future requests
+    r = yield async_requests.get(
+        url,
+        cookies=r.cookies,
+        allow_redirects=False,
+    )
+    r.raise_for_status()
+    assert r.url == url
+    reply = r.json()
+    assert reply['name'] == name
+
+
+@pytest.mark.gen_test
+def test_oauth_cookie_collision(app, mockservice_url):
+    service = mockservice_url
+    url = url_path_join(public_url(app, mockservice_url) + 'owhoami/')
+    print(url)
+    s = requests.Session()
+    name = 'mypha'
+    s.cookies = yield app.login_user(name)
+    # run session.get in async_requests thread
+    s_get = lambda *args, **kwargs: async_requests.executor.submit(s.get, *args, **kwargs)
+    state_cookie_name = 'service-%s-oauth-state' % service.name
+    service_cookie_name = 'service-%s' % service.name
+    oauth_1 = yield s_get(url, allow_redirects=False)
+    print(oauth_1.headers)
+    print(oauth_1.cookies, oauth_1.url, url)
+    assert state_cookie_name in s.cookies
+    state_cookies = [ s for s in s.cookies.keys() if s.startswith(state_cookie_name) ]
+    # only one state cookie
+    assert state_cookies == [state_cookie_name]
+    state_1 = s.cookies[state_cookie_name]
+
+    # start second oauth login before finishing the first
+    oauth_2 = yield s_get(url, allow_redirects=False)
+    state_cookies = [ s for s in s.cookies.keys() if s.startswith(state_cookie_name) ]
+    assert len(state_cookies) == 2
+    # get the random-suffix cookie name
+    state_cookie_2 = sorted(state_cookies)[-1]
+    # we didn't clobber the default cookie
+    assert s.cookies[state_cookie_name] == state_1
+
+    # finish oauth 2
+    url = oauth_2.headers['Location']
+    if not urlparse(url).netloc:
+        url = public_host(app) + url
+    r = yield s_get(url)
+    r.raise_for_status()
+    # after finishing, state cookie is cleared
+    assert state_cookie_2 not in s.cookies
+    # service login cookie is set
+    assert service_cookie_name in s.cookies
+    service_cookie_2 = s.cookies[service_cookie_name]
+
+    # finish oauth 1
+    url = oauth_1.headers['Location']
+    if not urlparse(url).netloc:
+        url = public_host(app) + url
+    r = yield s_get(url)
+    r.raise_for_status()
+    # after finishing, state cookie is cleared (again)
+    assert state_cookie_name not in s.cookies
+    # service login cookie is set (again, to a different value)
+    assert service_cookie_name in s.cookies
+    assert s.cookies[service_cookie_name] != service_cookie_2
+
+    # after completing both OAuth logins, no OAuth state cookies remain
+    state_cookies = [ s for s in s.cookies.keys() if s.startswith(state_cookie_name) ]
+    assert state_cookies == []

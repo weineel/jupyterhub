@@ -67,9 +67,13 @@ class HomeHandler(BaseHandler):
         if user.running:
             # trigger poll_and_notify event in case of a server that died
             yield user.spawner.poll_and_notify()
+        # send the user to /spawn if they aren't running,
+        # to establish that this is an explicit spawn request rather
+        # than an implicit one, which can be caused by any link to `/user/:name`
+        url = user.url if user.running else url_path_join(self.hub.base_url, 'spawn')
         html = self.render_template('home.html',
             user=user,
-            url=user.url,
+            url=url,
         )
         self.finish(html)
 
@@ -92,7 +96,10 @@ class SpawnHandler(BaseHandler):
 
     @web.authenticated
     def get(self):
-        """GET renders form for spawning with user-specified options"""
+        """GET renders form for spawning with user-specified options
+
+        or triggers spawn via redirect if there is no form.
+        """
         user = self.get_current_user()
         if not self.allow_named_servers and user.running:
             url = user.url
@@ -102,7 +109,12 @@ class SpawnHandler(BaseHandler):
         if user.spawner.options_form:
             self.finish(self._render_form())
         else:
-            # not running, no form. Trigger spawn.
+            # Explicit spawn request: clear _spawn_future
+            # which may have been saved to prevent implicit spawns
+            # after a failure.
+            if user.spawner._spawn_future and user.spawner._spawn_future.done():
+                user.spawner._spawn_future = None
+            # not running, no form. Trigger spawn by redirecting to /user/:name
             self.redirect(user.url)
 
     @web.authenticated
@@ -115,6 +127,10 @@ class SpawnHandler(BaseHandler):
             self.log.warning("User is already running: %s", url)
             self.redirect(url)
             return
+        if user.spawner.pending:
+            raise web.HTTPError(
+                400, "%s is pending %s" % (user.spawner._log_name, user.spawner.pending)
+            )
         form_options = {}
         for key, byte_list in self.request.body_arguments.items():
             form_options[key] = [ bs.decode('utf8') for bs in byte_list ]
@@ -146,14 +162,19 @@ class AdminHandler(BaseHandler):
         available = {'name', 'admin', 'running', 'last_activity'}
         default_sort = ['admin', 'name']
         mapping = {
-            'running': '_server_id'
+            'running': orm.Spawner.server_id,
         }
+        for name in available:
+            if name not in mapping:
+                mapping[name] = getattr(orm.User, name)
+
         default_order = {
             'name': 'asc',
             'last_activity': 'desc',
             'admin': 'desc',
             'running': 'desc',
         }
+
         sorts = self.get_arguments('sort') or default_sort
         orders = self.get_arguments('order')
 
@@ -176,11 +197,11 @@ class AdminHandler(BaseHandler):
 
         # this could be one incomprehensible nested list comprehension
         # get User columns
-        cols = [ getattr(orm.User, mapping.get(c, c)) for c in sorts ]
+        cols = [ mapping[c] for c in sorts ]
         # get User.col.desc() order objects
         ordered = [ getattr(c, o)() for c, o in zip(cols, orders) ]
 
-        users = self.db.query(orm.User).order_by(*ordered)
+        users = self.db.query(orm.User).outerjoin(orm.Spawner).order_by(*ordered)
         users = [ self._user_from_orm(u) for u in users ]
         running = [ u for u in users if u.running ]
 

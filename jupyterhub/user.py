@@ -12,7 +12,7 @@ from tornado import gen
 from tornado.log import app_log
 from traitlets import HasTraits, Any, Dict, default
 
-from .utils import url_path_join, default_server_name
+from .utils import url_path_join
 
 from . import orm
 from ._version import _check_version, __version__
@@ -201,6 +201,7 @@ class User(HasTraits):
             authenticator=self.authenticator,
             config=self.settings.get('config'),
             proxy_spec=url_path_join(self.proxy_spec, name, '/'),
+            db=self.db,
         )
         # update with kwargs. Mainly for testing.
         spawn_kwargs.update(kwargs)
@@ -237,7 +238,7 @@ class User(HasTraits):
     def running(self):
         """property for whether the user's default server is running"""
         return self.spawner.ready
-    
+
     @property
     def active(self):
         """True if any server is active"""
@@ -317,8 +318,6 @@ class User(HasTraits):
         url of the server will be /user/:name/:server_name
         """
         db = self.db
-        if self.allow_named_servers and not server_name:
-            server_name = default_server_name(self)
 
         base_url = url_path_join(self.base_url, server_name) + '/'
 
@@ -356,12 +355,11 @@ class User(HasTraits):
                 oauth_client = client_store.fetch_by_client_id(client_id)
             except ClientNotFoundError:
                 oauth_client = None
-            # create a new OAuth client + secret on every launch,
-            # except for resuming containers.
-            if oauth_client is None or not spawner.will_resume:
-                client_store.add_client(client_id, api_token,
-                                        url_path_join(self.url, 'oauth_callback'),
-                                        )
+            # create a new OAuth client + secret on every launch
+            # containers that resume will be updated below
+            client_store.add_client(client_id, api_token,
+                                    url_path_join(self.url, server_name, 'oauth_callback'),
+                                    )
         db.commit()
 
         # trigger pre-spawn hook on authenticator
@@ -369,7 +367,7 @@ class User(HasTraits):
         if (authenticator):
             yield gen.maybe_future(authenticator.pre_spawn_start(self, spawner))
 
-        spawner._spawn_pending = True
+        spawner._start_pending = True
         # wait for spawner.start to return
         try:
             # run optional preparation work to bootstrap the notebook
@@ -385,22 +383,50 @@ class User(HasTraits):
                 # prior to 0.7, spawners had to store this info in user.server themselves.
                 # Handle < 0.7 behavior with a warning, assuming info was stored in db by the Spawner.
                 self.log.warning("DEPRECATION: Spawner.start should return (ip, port) in JupyterHub >= 0.7")
-            if spawner.api_token != api_token:
+            if spawner.api_token and spawner.api_token != api_token:
                 # Spawner re-used an API token, discard the unused api_token
                 orm_token = orm.APIToken.find(self.db, api_token)
                 if orm_token is not None:
                     self.db.delete(orm_token)
                     self.db.commit()
+                # check if the re-used API token is valid
+                found = orm.APIToken.find(self.db, spawner.api_token)
+                if found:
+                    if found.user is not self.orm_user:
+                        self.log.error("%s's server is using %s's token! Revoking this token.",
+                            self.name, (found.user or found.service).name)
+                        self.db.delete(found)
+                        self.db.commit()
+                        raise ValueError("Invalid token for %s!" % self.name)
+                else:
+                    # Spawner.api_token has changed, but isn't in the db.
+                    # What happened? Maybe something unclean in a resumed container.
+                    self.log.warning("%s's server specified its own API token that's not in the database",
+                        self.name
+                    )
+                    # use generated=False because we don't trust this token
+                    # to have been generated properly
+                    self.new_api_token(spawner.api_token, generated=False)
+                # update OAuth client secret with updated API token
+                if oauth_provider:
+                    client_store = oauth_provider.client_authenticator.client_store
+                    client_store.add_client(client_id, spawner.api_token,
+                                            url_path_join(self.url, server_name, 'oauth_callback'),
+                                            )
+                    db.commit()
+
         except Exception as e:
             if isinstance(e, gen.TimeoutError):
                 self.log.warning("{user}'s server failed to start in {s} seconds, giving up".format(
                     user=self.name, s=spawner.start_timeout,
                 ))
                 e.reason = 'timeout'
+                self.settings['statsd'].incr('spawner.failure.timeout')
             else:
                 self.log.error("Unhandled error starting {user}'s server: {error}".format(
                     user=self.name, error=e,
                 ))
+                self.settings['statsd'].incr('spawner.failure.error')
                 e.reason = 'error'
             try:
                 yield self.stop()
@@ -409,6 +435,7 @@ class User(HasTraits):
                     user=self.name,
                 ), exc_info=True)
             # raise original exception
+            spawner._start_pending = False
             raise e
         spawner.start_polling()
 
@@ -432,11 +459,13 @@ class User(HasTraits):
                     )
                 )
                 e.reason = 'timeout'
+                self.settings['statsd'].incr('spawner.failure.http_timeout')
             else:
                 e.reason = 'error'
                 self.log.error("Unhandled error waiting for {user}'s server to show up at {url}: {error}".format(
                     user=self.name, url=server.url, error=e,
                 ))
+                self.settings['statsd'].incr('spawner.failure.http_error')
             try:
                 yield self.stop()
             except Exception:
@@ -448,9 +477,12 @@ class User(HasTraits):
         else:
             server_version = resp.headers.get('X-JupyterHub-Version')
             _check_version(__version__, server_version, self.log)
+            # record the Spawner version for better error messages
+            # if it doesn't work
+            spawner._jupyterhub_version = server_version
         finally:
             spawner._waiting_for_response = False
-            spawner._spawn_pending = False
+            spawner._start_pending = False
         return self
 
     @gen.coroutine
@@ -461,6 +493,7 @@ class User(HasTraits):
         """
         spawner = self.spawners[server_name]
         spawner._spawn_pending = False
+        spawner._start_pending = False
         spawner.stop_polling()
         spawner._stop_pending = True
         try:

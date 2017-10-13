@@ -85,9 +85,23 @@ def test_admin_not_admin(app):
 @pytest.mark.gen_test
 def test_admin(app):
     cookies = yield app.login_user('admin')
-    r = yield get_page('admin', app, cookies=cookies)
+    r = yield get_page('admin', app, cookies=cookies, allow_redirects=False)
     r.raise_for_status()
     assert r.url.endswith('/admin')
+
+
+@pytest.mark.parametrize('sort', [
+    'running',
+    'last_activity',
+    'admin',
+    'name',
+])
+@pytest.mark.gen_test
+def test_admin_sort(app, sort):
+    cookies = yield app.login_user('admin')
+    r = yield get_page('admin?sort=%s' % sort, app, cookies=cookies)
+    r.raise_for_status()
+    assert r.status_code == 200
 
 
 @pytest.mark.gen_test
@@ -112,11 +126,21 @@ def test_spawn_redirect(app):
     # should have started server
     status = yield u.spawner.poll()
     assert status is None
-    
+
     # test spawn page when server is already running (just redirect)
     r = yield get_page('spawn', app, cookies=cookies)
     r.raise_for_status()
     print(urlparse(r.url))
+    path = urlparse(r.url).path
+    assert path == ujoin(app.base_url, '/user/%s/' % name)
+
+    # stop server to ensure /user/name is handled by the Hub
+    r = yield api_request(app, 'users', name, 'server', method='delete', cookies=cookies)
+    r.raise_for_status()
+
+    # test handing of trailing slash on `/user/name`
+    r = yield get_page('user/' + name, app, hub=False, cookies=cookies)
+    r.raise_for_status()
     path = urlparse(r.url).path
     assert path == ujoin(app.base_url, '/user/%s/' % name)
 
@@ -320,6 +344,19 @@ def test_auto_login(app, request):
         r = yield async_requests.get(base_url)
     assert r.url == public_url(app, path='hub/dummy')
 
+@pytest.mark.gen_test
+def test_auto_login_logout(app):
+    name = 'burnham'
+    cookies = yield app.login_user(name)
+
+    with mock.patch.dict(app.tornado_application.settings, {
+        'authenticator': Authenticator(auto_login=True),
+    }):
+        r = yield async_requests.get(public_host(app) + app.tornado_settings['logout_url'], cookies=cookies)
+    r.raise_for_status()
+    logout_url = public_host(app) + app.tornado_settings['logout_url']
+    assert r.url == logout_url
+    assert r.cookies == {}
 
 @pytest.mark.gen_test
 def test_logout(app):

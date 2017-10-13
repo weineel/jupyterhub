@@ -22,6 +22,7 @@ except ImportError:
 
 from traitlets import (
     Bool,
+    Bytes,
     Unicode,
     CUnicode,
     default,
@@ -115,20 +116,6 @@ class OAuthCallbackHandler(HubOAuthCallbackHandler, IPythonHandler):
     @property
     def hub_auth(self):
         return self.settings['hub_auth']
-    
-    def get(self):
-        code = self.get_argument("code", False)
-        if not code:
-            raise HTTPError(400, "oauth callback made without a token")
-        # TODO: make async (in a Thread?)
-        token = self.hub_auth.token_for_code(code)
-        user_model = self.hub_auth.user_for_token(token)
-        if user_model is None:
-            raise HTTPError(500, "oauth callback failed to identify a user")
-        self.log.info("Logged-in user %s", user_model)
-        self.hub_auth.set_cookie(self, token)
-        next_url = self.get_argument('next', '') or self.base_url
-        self.redirect(next_url)
 
 
 # register new hub related command-line aliases
@@ -157,11 +144,13 @@ page_template = """
 {% block header_buttons %}
 {{super()}}
 
-<a href='{{hub_control_panel_url}}'
- class='btn btn-default btn-sm navbar-btn pull-right'
- style='margin-right: 4px; margin-left: 2px;'
->
-Control Panel</a>
+<span>
+    <a href='{{hub_control_panel_url}}'
+       class='btn btn-default btn-sm navbar-btn pull-right'
+       style='margin-right: 4px; margin-left: 2px;'>
+        Control Panel
+    </a>
+</span>
 {% endblock %}
 {% block logo %}
 <img src='{{logo_url}}' alt='Jupyter Notebook'/>
@@ -192,6 +181,15 @@ class SingleUserNotebookApp(NotebookApp):
     subcommands = {}
     version = __version__
     classes = NotebookApp.classes + [HubOAuth]
+    
+    # don't store cookie secrets
+    cookie_secret_file = ''
+    # always generate a new cookie secret on launch
+    # ensures that each spawn clears any cookies from previous session,
+    # triggering OAuth again
+    cookie_secret = Bytes()
+    def _cookie_secret_default(self):
+        return os.urandom(32)
 
     user = CUnicode().tag(config=True)
     group = CUnicode().tag(config=True)

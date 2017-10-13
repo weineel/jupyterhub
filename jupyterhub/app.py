@@ -23,6 +23,7 @@ if sys.version_info[:2] < (3, 3):
 
 from jinja2 import Environment, FileSystemLoader
 
+from sqlalchemy import create_engine
 from sqlalchemy.exc import OperationalError
 
 from tornado.httpclient import AsyncHTTPClient
@@ -62,7 +63,7 @@ from .utils import (
 from .auth import Authenticator, PAMAuthenticator
 from .crypto import CryptKeeper
 from .spawner import Spawner, LocalProcessSpawner
-from .objects import Hub
+from .objects import Hub, Server
 
 # For faking stats
 from .emptyclass import EmptyClass
@@ -189,6 +190,13 @@ class UpgradeDB(Application):
             db_file = hub.db_url.split(':///', 1)[1]
             self._backup_db_file(db_file)
         self.log.info("Upgrading %s", hub.db_url)
+        # run check-db-revision first
+        engine = create_engine(hub.db_url)
+        try:
+            orm.check_db_revision(engine)
+        except orm.DatabaseSchemaMismatch:
+            # ignore mismatch error because that's what we are here for!
+            pass
         dbutil.upgrade(hub.db_url)
 
 
@@ -291,13 +299,13 @@ class JupyterHub(Application):
     ssl_key = Unicode('',
         help="""Path to SSL key file for the public facing interface of the proxy
 
-        Use with ssl_cert
+        When setting this, you should also set ssl_cert
         """
     ).tag(config=True)
     ssl_cert = Unicode('',
         help="""Path to SSL certificate file for the public facing interface of the proxy
 
-        Use with ssl_key
+        When setting this, you should also set ssl_key
         """
     ).tag(config=True)
     ip = Unicode('',
@@ -360,7 +368,7 @@ class JupyterHub(Application):
     proxy_cmd = Command([], config=True,
         help="DEPRECATED since version 0.8. Use ConfigurableHTTPProxy.command",
     ).tag(config=True)
-    
+
     debug_proxy = Bool(False,
         help="DEPRECATED since version 0.8: Use ConfigurableHTTPProxy.debug",
     ).tag(config=True)
@@ -465,7 +473,7 @@ class JupyterHub(Application):
         help="""The cookie secret to use to encrypt cookies.
 
         Loaded from the JPY_COOKIE_SECRET env variable by default.
-        
+
         Should be exactly 256 bits (32 bytes).
         """
     ).tag(
@@ -801,12 +809,10 @@ class JupyterHub(Application):
         self.handlers = self.add_url_prefix(self.hub_prefix, h)
         # some extra handlers, outside hub_prefix
         self.handlers.extend([
-            (r"%s" % self.hub_prefix.rstrip('/'), web.RedirectHandler,
-                {
-                    "url": self.hub_prefix,
-                    "permanent": False,
-                }
-            ),
+            # add trailing / to `/hub`
+            (self.hub_prefix.rstrip('/'), handlers.AddSlashHandler),
+            # add trailing / to ``/user|services/:name`
+            (r"%s(user|services)/([^/]+)" % self.base_url, handlers.AddSlashHandler),
             (r"(?!%s).*" % self.hub_prefix, handlers.PrefixRedirectHandler),
             (r'(.*)', handlers.Template404),
         ])
@@ -1180,7 +1186,7 @@ class JupyterHub(Application):
             if not service.url:
                 continue
             try:
-                yield service.orm.server.wait_up(timeout=1)
+                yield Server.from_orm(service.orm.server).wait_up(timeout=1)
             except TimeoutError:
                 self.log.warning("Cannot connect to %s service %s at %s", service.kind, name, service.url)
             else:
@@ -1221,7 +1227,7 @@ class JupyterHub(Application):
                         status = yield spawner.poll()
                     except Exception:
                         self.log.exception("Failed to poll spawner for %s, assuming the spawner is not running.",
-                            user.name if name else '%s|%s' % (user.name, name))
+                            spawner._log_name)
                         status = -1
 
                 if status is None:
@@ -1232,11 +1238,13 @@ class JupyterHub(Application):
                     # user not running. This is expected if server is None,
                     # but indicates the user's server died while the Hub wasn't running
                     # if spawner.server is defined.
-                    log = self.log.warning if spawner.server else self.log.debug
-                    log("%s not running.", user.name)
-                    # remove all server or servers entry from db related to the user
                     if spawner.server:
+                        self.log.warning("%s appears to have stopped while the Hub was down", spawner._log_name)
+                        # remove server entry from db
                         db.delete(spawner.orm_spawner.server)
+                        spawner.server = None
+                    else:
+                        self.log.debug("%s not running", spawner._log_name)
             db.commit()
 
             user_summaries.append(_user_summary(user))
@@ -1557,7 +1565,7 @@ class JupyterHub(Application):
                 tries = 10 if service.managed else 1
                 for i in range(tries):
                     try:
-                        yield service.orm.server.wait_up(http=True, timeout=1)
+                        yield Server.from_orm(service.orm.server).wait_up(http=True, timeout=1)
                     except TimeoutError:
                         if service.managed:
                             status = yield service.spawner.poll()
@@ -1568,7 +1576,7 @@ class JupyterHub(Application):
                         break
                 else:
                     self.log.error("Cannot connect to %s service %s at %s. Is it running?", service.kind, service_name, service.url)
-        
+
         yield self.proxy.check_routes(self.users, self._service_map)
 
 

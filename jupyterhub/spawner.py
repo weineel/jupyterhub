@@ -18,7 +18,7 @@ from tempfile import mkdtemp
 from sqlalchemy import inspect
 
 from tornado import gen
-from tornado.ioloop import PeriodicCallback, IOLoop
+from tornado.ioloop import PeriodicCallback
 
 from traitlets.config import LoggingConfigurable
 from traitlets import (
@@ -49,9 +49,23 @@ class Spawner(LoggingConfigurable):
     
     # private attributes for tracking status
     _spawn_pending = False
+    _start_pending = False
     _stop_pending = False
     _proxy_pending = False
     _waiting_for_response = False
+    _jupyterhub_version = None
+    _spawn_future = None
+
+    @property
+    def _log_name(self):
+        """Return username:servername or username
+
+        Used in logging for consistency with named servers.
+        """
+        if self.name:
+            return '%s:%s' % (self.user.name, self.name)
+        else:
+            return self.user.name
 
     @property
     def pending(self):
@@ -59,7 +73,7 @@ class Spawner(LoggingConfigurable):
 
         Return False if nothing is pending.
         """
-        if self._spawn_pending or self._proxy_pending:
+        if self._spawn_pending:
             return 'spawn'
         elif self._stop_pending:
             return 'stop'
@@ -89,6 +103,7 @@ class Spawner(LoggingConfigurable):
     authenticator = Any()
     hub = Any()
     orm_spawner = Any()
+    db = Any()
 
     @observe('orm_spawner')
     def _orm_spawner_changed(self, change):
@@ -824,7 +839,7 @@ class LocalProcessSpawner(Spawner):
     This is the default spawner for JupyterHub.
     """
 
-    INTERRUPT_TIMEOUT = Integer(10,
+    interrupt_timeout = Integer(10,
         help="""
         Seconds to wait for single-user server process to halt after SIGINT.
 
@@ -832,7 +847,7 @@ class LocalProcessSpawner(Spawner):
         """
     ).tag(config=True)
 
-    TERM_TIMEOUT = Integer(5,
+    term_timeout = Integer(5,
         help="""
         Seconds to wait for single-user server process to halt after SIGTERM.
 
@@ -840,7 +855,7 @@ class LocalProcessSpawner(Spawner):
         """
     ).tag(config=True)
 
-    KILL_TIMEOUT = Integer(5,
+    kill_timeout = Integer(5,
         help="""
         Seconds to wait for process to halt after SIGKILL before giving up.
 
@@ -1056,7 +1071,7 @@ class LocalProcessSpawner(Spawner):
                 return
             self.log.debug("Interrupting %i", self.pid)
             yield self._signal(signal.SIGINT)
-            yield self.wait_for_death(self.INTERRUPT_TIMEOUT)
+            yield self.wait_for_death(self.interrupt_timeout)
 
         # clean shutdown failed, use TERM
         status = yield self.poll()
@@ -1064,7 +1079,7 @@ class LocalProcessSpawner(Spawner):
             return
         self.log.debug("Terminating %i", self.pid)
         yield self._signal(signal.SIGTERM)
-        yield self.wait_for_death(self.TERM_TIMEOUT)
+        yield self.wait_for_death(self.term_timeout)
 
         # TERM failed, use KILL
         status = yield self.poll()
@@ -1072,7 +1087,7 @@ class LocalProcessSpawner(Spawner):
             return
         self.log.debug("Killing %i", self.pid)
         yield self._signal(signal.SIGKILL)
-        yield self.wait_for_death(self.KILL_TIMEOUT)
+        yield self.wait_for_death(self.kill_timeout)
 
         status = yield self.poll()
         if status is None:

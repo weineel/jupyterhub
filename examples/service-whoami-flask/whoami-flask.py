@@ -17,7 +17,7 @@ prefix = os.environ.get('JUPYTERHUB_SERVICE_PREFIX', '/')
 
 auth = HubAuth(
     api_token=os.environ['JUPYTERHUB_API_TOKEN'],
-    cookie_cache_max_age=60,
+    cache_max_age=60,
 )
 
 app = Flask(__name__)
@@ -28,8 +28,11 @@ def authenticated(f):
     @wraps(f)
     def decorated(*args, **kwargs):
         cookie = request.cookies.get(auth.cookie_name)
+        token = request.headers.get(auth.auth_header_name)
         if cookie:
             user = auth.user_for_cookie(cookie)
+        elif token:
+            user = auth.user_for_token(token)
         else:
             user = None
         if user:

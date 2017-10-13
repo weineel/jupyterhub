@@ -20,7 +20,7 @@ class LogoutHandler(BaseHandler):
             self.clear_login_cookie()
             self.statsd.incr('logout')
         if self.authenticator.auto_login:
-            self.render('logout.html')
+            self.render_template('logout.html')
         else:
             self.redirect(self.settings['login_url'], permanent=False)
 
@@ -84,10 +84,11 @@ class LoginHandler(BaseHandler):
 
         if user:
             already_running = False
-            if user.spawner:
+            if user.spawner.ready:
                 status = yield user.spawner.poll()
                 already_running = (status is None)
-            if not already_running and not user.spawner.options_form:
+            if not already_running and not user.spawner.options_form \
+                    and not user.spawner.pending:
                 # logging in triggers spawn
                 yield self.spawn_single_user(user)
             self.redirect(self.get_next_url())
